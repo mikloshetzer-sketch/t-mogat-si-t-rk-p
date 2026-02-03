@@ -2,65 +2,73 @@ import requests
 import json
 from datetime import datetime
 
-API_URL = "https://api.humdata.org/v1/fts/flows"
+YEAR = 2025
 
+# Donor kódok az FTS rendszer szerint
 DONORS = {
     "EU": "European Union",
-    "USA": "United States of America",
-    "China": "China",
-    "Russia": "Russian Federation"
+    "USA": "United States",
+    "Germany": "Germany",
+    "UK": "United Kingdom",
+    "Japan": "Japan",
+    "France": "France",
+    "Canada": "Canada",
+    "Sweden": "Sweden",
+    "Norway": "Norway",
+    "Netherlands": "Netherlands"
 }
 
-YEAR = 2025
-TOP_N = 10
+BASE_URL = "https://api.hpc.tools/v1/public/fts/flow"
+
 
 def get_top10(donor_name):
     params = {
-        "donor": donor_name,
-        "year": YEAR
+        "year": YEAR,
+        "donor": donor_name
     }
 
-    r = requests.get(API_URL, params=params, timeout=30)
-    r.raise_for_status()
-    data = r.json()
+    try:
+        response = requests.get(BASE_URL, params=params, timeout=60)
+        response.raise_for_status()
+        data = response.json()
+    except Exception as e:
+        print(f"Error fetching {donor_name}: {e}")
+        return []
 
-    country_totals = {}
+    flows = data.get("data", [])
 
-    for flow in data.get("data", []):
-        country = flow.get("destination", {}).get("name")
-        amount = flow.get("amountUSD", 0)
+    # ország + összeg összesítése
+    totals = {}
+    for item in flows:
+        country = item.get("destination", "Unknown")
+        amount = float(item.get("amountUSD", 0))
+        totals[country] = totals.get(country, 0) + amount
 
-        if not country:
-            continue
-
-        country_totals[country] = country_totals.get(country, 0) + amount
-
-    top = sorted(
-        country_totals.items(),
-        key=lambda x: x[1],
-        reverse=True
-    )[:TOP_N]
+    # TOP10 rendezés
+    top10 = sorted(totals.items(), key=lambda x: x[1], reverse=True)[:10]
 
     return [
-        {"country": c, "amount": round(a, 2)}
-        for c, a in top
+        {"country": country, "amount_usd": round(amount, 2)}
+        for country, amount in top10
     ]
+
 
 def main():
     result = {
         "year": YEAR,
-        "updated": datetime.utcnow().isoformat() + "Z",
+        "updated": datetime.utcnow().isoformat(),
         "donors": {}
     }
 
     for key, name in DONORS.items():
-        print(f"Fetching {key} data...")
+        print(f"Fetching data for {name}...")
         result["donors"][key] = get_top10(name)
 
     with open("data/top10_2025.json", "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2, ensure_ascii=False)
 
     print("Data updated: data/top10_2025.json")
+
 
 if __name__ == "__main__":
     main()
