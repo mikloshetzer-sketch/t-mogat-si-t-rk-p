@@ -1,1 +1,39 @@
+<!doctype html>
+<html lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>2025 TOP10 támogatások – EU/USA/Kína/Oroszország</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+</head>
+<body>
+  <h1 style="font-family:Arial,sans-serif;padding:10px;">
+    2025 – TOP10 pénzügyi támogatások országonként (4 donor)
+  </h1>
+  <p style="padding:0 10px;color:#555;">
+    Adat: OCHA Financial Tracking Service (FTS) – humanitárius finanszírozás (reported)
+  </p>
 
+  <div id="grid" style="display:grid;grid-template-columns:1fr 1fr;gap:10px;padding:10px;">
+    <div>
+      <h3>EU</h3>
+      <div id="map-eu" style="height:350px;"></div>
+    </div>
+    <div>
+      <h3>USA</h3>
+      <div id="map-usa" style="height:350px;"></div>
+    </div>
+    <div>
+      <h3>Kína</h3>
+      <div id="map-china" style="height:350px;"></div>
+    </div>
+    <div>
+      <h3>Oroszország</h3>
+      <div id="map-russia" style="height:350px;"></div>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="./app.js"></script>
+</body>
+</html>
