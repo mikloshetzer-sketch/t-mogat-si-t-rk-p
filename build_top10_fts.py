@@ -1,115 +1,66 @@
-import json
-import os
 import requests
-from collections import defaultdict
+import json
+from datetime import datetime
 
-YEAR = 2025
-BASE = "https://api.hpc.tools/v1"
+API_URL = "https://api.humdata.org/v1/fts/flows"
 
 DONORS = {
-    "eu": ["European Union", "European Commission"],
-    "usa": ["United States"],
-    "china": ["China"],
-    "russia": ["Russian Federation", "Russia"],
+    "EU": "European Union",
+    "USA": "United States of America",
+    "China": "China",
+    "Russia": "Russian Federation"
 }
 
-RESTCOUNTRIES = "https://restcountries.com/v3.1/alpha/{}"
+YEAR = 2025
+TOP_N = 10
 
+def get_top10(donor_name):
+    params = {
+        "donor": donor_name,
+        "year": YEAR
+    }
 
-def get_json(url, params=None):
-    r = requests.get(url, params=params, timeout=60, headers={"User-Agent": "github-actions"})
+    r = requests.get(API_URL, params=params, timeout=30)
     r.raise_for_status()
-    return r.json()
+    data = r.json()
 
+    country_totals = {}
 
-def get_centroid(iso3):
-    try:
-        data = get_json(RESTCOUNTRIES.format(iso3))
-        lat, lon = data[0]["latlng"]
-        return float(lat), float(lon)
-    except Exception:
-        return 0.0, 0.0
+    for flow in data.get("data", []):
+        country = flow.get("destination", {}).get("name")
+        amount = flow.get("amountUSD", 0)
 
-
-def find_donors():
-    donors = get_json(f"{BASE}/public/fts/donor")
-    rows = donors.get("data", donors)
-    ids = {}
-
-    for key, patterns in DONORS.items():
-        for d in rows:
-            name = (d.get("name") or "")
-            if any(p.lower() in name.lower() for p in patterns):
-                ids[key] = d.get("id")
-                break
-
-    return ids
-
-
-def top10_for_donor(donor_id):
-    flows = []
-    offset = 0
-    limit = 500
-
-    while True:
-        params = {
-            "donor": donor_id,
-            "year": YEAR,
-            "limit": limit,
-            "offset": offset,
-            "currency": "USD",
-        }
-        data = get_json(f"{BASE}/public/fts/flow", params)
-        rows = data.get("data", data)
-        if not rows:
-            break
-        flows.extend(rows)
-        offset += limit
-
-    agg = defaultdict(lambda: {"amount": 0.0, "name": ""})
-
-    for r in flows:
-        iso3 = (r.get("destinationIso3") or "").upper()
-        if not iso3:
+        if not country:
             continue
-        agg[iso3]["amount"] += float(r.get("amountUSD") or 0.0)
-        agg[iso3]["name"] = r.get("destinationName") or iso3
 
-    items = sorted(agg.items(), key=lambda x: x[1]["amount"], reverse=True)[:10]
+        country_totals[country] = country_totals.get(country, 0) + amount
 
-    result = []
-    for i, (iso3, info) in enumerate(items, start=1):
-        lat, lon = get_centroid(iso3)
-        result.append(
-            {
-                "rank": i,
-                "iso3": iso3,
-                "country_name": info["name"],
-                "amount_usd": round(info["amount"], 2),
-                "lat": lat,
-                "lon": lon,
-            }
-        )
+    top = sorted(
+        country_totals.items(),
+        key=lambda x: x[1],
+        reverse=True
+    )[:TOP_N]
 
-    return result
-
+    return [
+        {"country": c, "amount": round(a, 2)}
+        for c, a in top
+    ]
 
 def main():
-    donor_ids = find_donors()
-    out = {}
+    result = {
+        "year": YEAR,
+        "updated": datetime.utcnow().isoformat() + "Z",
+        "donors": {}
+    }
 
-    for key, did in donor_ids.items():
-        if did:
-            out[key] = top10_for_donor(did)
-        else:
-            out[key] = []
+    for key, name in DONORS.items():
+        print(f"Fetching {key} data...")
+        result["donors"][key] = get_top10(name)
 
-    os.makedirs("data", exist_ok=True)
     with open("data/top10_2025.json", "w", encoding="utf-8") as f:
-        json.dump(out, f, ensure_ascii=False, indent=2)
+        json.dump(result, f, indent=2, ensure_ascii=False)
 
-    print("TOP10 data updated")
-
+    print("Data updated: data/top10_2025.json")
 
 if __name__ == "__main__":
     main()
