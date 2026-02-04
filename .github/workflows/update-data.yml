@@ -3,7 +3,7 @@ name: Update donor TOP10 (2025)
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 6 * * *"   # naponta 06:00 UTC (opcionális)
+    - cron: "0 6 * * *"   # naponta 06:00 UTC
 
 permissions:
   contents: write
@@ -15,8 +15,6 @@ jobs:
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0   # kell a pull --rebase miatt
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -27,25 +25,12 @@ jobs:
         run: pip install requests
 
       - name: Run updater
-        run: python ./build_top10_fts.py
+        run: python build_top10_fts.py
 
       - name: Commit & push if changed
         run: |
-          set -e
           git config user.name "github-actions"
           git config user.email "actions@github.com"
-
-          # csak akkor commitolunk, ha tényleg változott a JSON
           git add data/top10_2025.json
-          if git diff --cached --quiet; then
-            echo "No changes in data/top10_2025.json"
-            exit 0
-          fi
-
-          git commit -m "Auto-update TOP10 data"
-
-          # FONTOS: előbb integráljuk a remote változásokat, különben 'rejected'
-          git pull --rebase origin main
-
-          # push
-          git push origin main
+          git commit -m "Auto-update TOP10 data" || echo "No changes"
+          git push
