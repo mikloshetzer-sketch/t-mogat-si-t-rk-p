@@ -1,260 +1,216 @@
-// app.js — donor TOP10 map renderer (commitments + disbursements)
-// Expects: data/top10_2025.json with structure:
-// { year, updated, donors: { "EU": { commitments: [...], disbursements: [...] }, ... } }
+/* app.js
+   - Betölti: data/top10_2025.json
+   - Kezeli mindkét formátumot:
+       donors[donor] = []                         (régi)
+       donors[donor] = {commitments:[], disbursements:[]}  (új)
+   - Mindkét értéket külön megjeleníti (commitments + disbursements)
+   - Akkor is kirajzolja a térképet, ha nincs adat (ne legyen "üres fehér")
+*/
 
-const DATA_URL = "./data/top10_2025.json";
+const DATA_URL = "data/top10_2025.json";
 
 const DONOR_ORDER = [
-  "EU",
-  "USA",
-  "Germany",
-  "UK",
-  "Japan",
-  "France",
-  "Canada",
-  "Sweden",
-  "Norway",
-  "Netherlands",
-  "China",
-  "Russia",
+  "EU", "USA", "China", "Russia", "Germany", "UK", "Japan", "France",
+  "Canada", "Sweden", "Norway", "Netherlands"
 ];
 
-const DEFAULT_CENTER = [20, 10];
-const DEFAULT_ZOOM = 2;
-
-function el(tag, attrs = {}, ...children) {
-  const n = document.createElement(tag);
-  for (const [k, v] of Object.entries(attrs || {})) {
-    if (k === "class") n.className = v;
-    else if (k === "style") Object.assign(n.style, v);
-    else n.setAttribute(k, v);
-  }
-  for (const c of children) {
-    if (c == null) continue;
-    if (typeof c === "string") n.appendChild(document.createTextNode(c));
-    else n.appendChild(c);
-  }
-  return n;
-}
-
-function safeNum(x) {
+function fmtUSD(x) {
+  if (x === null || x === undefined || isNaN(Number(x))) return "–";
   const n = Number(x);
-  return Number.isFinite(n) ? n : 0;
+  // rövid, érthető formátum
+  return n.toLocaleString(undefined, { maximumFractionDigits: 0 }) + " USD";
 }
 
-function pick(obj, keys, fallback = null) {
-  for (const k of keys) {
-    if (obj && obj[k] != null) return obj[k];
+// Normalizálás: mindig egy lista legyen, ahol elem:
+// { recipient, commitments, disbursements }
+function normalizeDonorData(raw) {
+  // Új formátum
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    const c = Array.isArray(raw.commitments) ? raw.commitments : [];
+    const d = Array.isArray(raw.disbursements) ? raw.disbursements : [];
+
+    // Ha a build script eleve így adja vissza: [{recipient, amount}, ...]
+    // akkor összefésüljük recipient szerint.
+    const byRecipient = new Map();
+
+    for (const it of c) {
+      const recipient = it.recipient || it.location || it.country || it.name || it.recipient_name || it.to || "Unknown";
+      const amount = it.amount ?? it.value ?? it.total ?? it.usd ?? it.funding ?? 0;
+      if (!byRecipient.has(recipient)) byRecipient.set(recipient, { recipient, commitments: 0, disbursements: 0 });
+      byRecipient.get(recipient).commitments += Number(amount) || 0;
+    }
+
+    for (const it of d) {
+      const recipient = it.recipient || it.location || it.country || it.name || it.recipient_name || it.to || "Unknown";
+      const amount = it.amount ?? it.value ?? it.total ?? it.usd ?? it.funding ?? 0;
+      if (!byRecipient.has(recipient)) byRecipient.set(recipient, { recipient, commitments: 0, disbursements: 0 });
+      byRecipient.get(recipient).disbursements += Number(amount) || 0;
+    }
+
+    return Array.from(byRecipient.values())
+      .sort((a, b) => (b.disbursements + b.commitments) - (a.disbursements + a.commitments))
+      .slice(0, 10);
   }
-  return fallback;
-}
 
-function fmtUSD(v) {
-  const n = safeNum(v);
-  try {
-    return new Intl.NumberFormat("en-US", {
-      style: "currency",
-      currency: "USD",
-      maximumFractionDigits: 0,
-    }).format(n);
-  } catch {
-    return `$${Math.round(n).toLocaleString("en-US")}`;
+  // Régi formátum: tömb (feltételezzük, hogy amount van benne)
+  if (Array.isArray(raw)) {
+    return raw.slice(0, 10).map(it => {
+      const recipient = it.recipient || it.location || it.country || it.name || it.recipient_name || it.to || "Unknown";
+      const amount = it.amount ?? it.value ?? it.total ?? it.usd ?? it.funding ?? 0;
+      return { recipient, commitments: 0, disbursements: Number(amount) || 0 };
+    });
   }
+
+  return [];
 }
 
-function normalizeItem(item) {
-  // Try to support multiple possible field names
-  const lat = pick(item, ["lat", "latitude", "y"]);
-  const lon = pick(item, ["lon", "lng", "longitude", "x"]);
-  const amount = pick(item, ["amount_usd", "amount", "value", "total_usd", "total"]);
-  const country = pick(item, ["country", "country_name", "recipient", "location"], "Unknown");
-  const iso3 = pick(item, ["iso3", "country_iso3"], null);
-
-  const latN = Number(lat);
-  const lonN = Number(lon);
-  if (!Number.isFinite(latN) || !Number.isFinite(lonN)) return null;
-
-  return {
-    country,
-    iso3,
-    lat: latN,
-    lon: lonN,
-    amount: safeNum(amount),
-    raw: item,
-  };
-}
-
-function radiusFromAmount(amount) {
-  // Nice-ish scaling: sqrt to reduce extremes
-  const a = Math.max(0, safeNum(amount));
-  const r = Math.sqrt(a) / 800; // tweak factor
-  return Math.min(28, Math.max(4, r));
-}
-
-function sumAmounts(list) {
-  return (list || []).reduce((acc, it) => acc + safeNum(it.amount), 0);
-}
-
-async function loadData() {
-  const res = await fetch(DATA_URL, { cache: "no-store" });
-  if (!res.ok) throw new Error(`Failed to load ${DATA_URL}: ${res.status}`);
-  return res.json();
-}
-
-function ensureLeafletReady() {
-  if (!window.L) {
-    throw new Error("Leaflet (window.L) not found. Check Leaflet JS include in index.html.");
+function ensureBaseLayout() {
+  // Ha van #app, oda dolgozunk, különben létrehozzuk
+  let root = document.getElementById("app");
+  if (!root) {
+    root = document.createElement("div");
+    root.id = "app";
+    document.body.appendChild(root);
   }
+
+  // Minimál stílus inline (ne kelljen CSS-t piszkálni)
+  root.style.maxWidth = "1200px";
+  root.style.margin = "16px auto";
+  root.style.padding = "0 12px";
+  root.style.fontFamily = "system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif";
+
+  return root;
 }
 
-function buildDonorSection(root, donorKey, donorObj) {
-  const title = el("h2", { class: "donor-title" }, donorKey);
+function createDonorSection(root, donorName) {
+  const section = document.createElement("section");
+  section.style.margin = "24px 0";
+  section.style.padding = "12px 0";
+  section.style.borderTop = "1px solid rgba(0,0,0,0.08)";
 
-  const card = el("div", { class: "donor-card" });
-  const headerRow = el("div", { class: "donor-header" }, title);
+  const h2 = document.createElement("h2");
+  h2.textContent = donorName;
+  h2.style.margin = "0 0 10px 0";
 
-  const mapDiv = el("div", {
-    class: "map",
-    id: `map-${donorKey.replace(/\s+/g, "-")}`,
-    style: { height: "360px", width: "100%", borderRadius: "12px" },
-  });
+  const row = document.createElement("div");
+  row.style.display = "grid";
+  row.style.gridTemplateColumns = "1.2fr 1fr";
+  row.style.gap = "12px";
+  row.style.alignItems = "start";
 
-  const info = el("div", { class: "donor-info", style: { margin: "10px 0 0 0" } });
+  const mapBox = document.createElement("div");
+  mapBox.style.height = "260px";
+  mapBox.style.borderRadius = "12px";
+  mapBox.style.overflow = "hidden";
+  mapBox.style.border = "1px solid rgba(0,0,0,0.12)";
 
-  card.appendChild(headerRow);
-  card.appendChild(mapDiv);
-  card.appendChild(info);
-  root.appendChild(card);
+  const mapId = "map_" + donorName.replace(/\W+/g, "_");
+  mapBox.id = mapId;
 
-  const commitmentsRaw = (donorObj && donorObj.commitments) || [];
-  const disbursementsRaw = (donorObj && donorObj.disbursements) || [];
+  const listBox = document.createElement("div");
+  listBox.style.border = "1px solid rgba(0,0,0,0.12)";
+  listBox.style.borderRadius = "12px";
+  listBox.style.padding = "10px 12px";
+  listBox.style.minHeight = "260px";
 
-  const commitments = commitmentsRaw.map(normalizeItem).filter(Boolean);
-  const disbursements = disbursementsRaw.map(normalizeItem).filter(Boolean);
+  const note = document.createElement("div");
+  note.style.fontSize = "13px";
+  note.style.opacity = "0.8";
+  note.style.marginBottom = "8px";
+  note.textContent = "Commitments és Disbursements külön értékként.";
 
-  const totalC = sumAmounts(commitments);
-  const totalD = sumAmounts(disbursements);
+  const ul = document.createElement("ol");
+  ul.style.margin = "0";
+  ul.style.paddingLeft = "18px";
 
-  // Header totals (külön-külön látszik mindkettő)
-  info.appendChild(
-    el(
-      "div",
-      { class: "totals" },
-      `Commitments: ${fmtUSD(totalC)}  |  Disbursements: ${fmtUSD(totalD)}`
-    )
-  );
+  listBox.appendChild(note);
+  listBox.appendChild(ul);
 
-  ensureLeafletReady();
+  row.appendChild(mapBox);
+  row.appendChild(listBox);
 
-  const map = L.map(mapDiv, { scrollWheelZoom: false }).setView(DEFAULT_CENTER, DEFAULT_ZOOM);
+  section.appendChild(h2);
+  section.appendChild(row);
 
+  root.appendChild(section);
+
+  // Leaflet map: akkor is legyen alaptérkép, ha nincs marker
+  const map = L.map(mapId, { zoomControl: true }).setView([20, 0], 2);
   L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-    maxZoom: 8,
-    attribution: '&copy; <a href="https://www.openstreetmap.org/">OpenStreetMap</a>',
+    maxZoom: 6,
+    attribution: '&copy; OpenStreetMap'
   }).addTo(map);
 
-  const layerCommit = L.layerGroup();
-  const layerDisb = L.layerGroup();
+  return { ul, map };
+}
 
-  function addMarkers(items, layer, label) {
-    for (const it of items) {
-      const r = radiusFromAmount(it.amount);
-      const marker = L.circleMarker([it.lat, it.lon], {
-        radius: r,
-        weight: 1,
-        fillOpacity: 0.55,
-      });
+function fillList(ul, items) {
+  ul.innerHTML = "";
 
-      const nameLine = it.iso3 ? `${it.country} (${it.iso3})` : `${it.country}`;
-      const html =
-        `<b>${nameLine}</b><br/>` +
-        `<b>${label}:</b> ${fmtUSD(it.amount)}`;
-
-      marker.bindPopup(html);
-      marker.addTo(layer);
-    }
+  if (!items || items.length === 0) {
+    const li = document.createElement("li");
+    li.textContent = "Nincs adat / nincs riportált TOP10 tétel.";
+    ul.appendChild(li);
+    return;
   }
 
-  addMarkers(commitments, layerCommit, "Commitments");
-  addMarkers(disbursements, layerDisb, "Disbursements");
-
-  // Default: both shown, but elkülöníthető (Layer control)
-  layerCommit.addTo(map);
-  layerDisb.addTo(map);
-
-  L.control
-    .layers(
-      {},
-      {
-        Commitments: layerCommit,
-        Disbursements: layerDisb,
-      },
-      { collapsed: false }
-    )
-    .addTo(map);
-
-  // Fit bounds if any data exists
-  const allPts = [...commitments, ...disbursements];
-  if (allPts.length > 0) {
-    const bounds = L.latLngBounds(allPts.map((p) => [p.lat, p.lon]));
-    map.fitBounds(bounds.pad(0.2));
-  } else {
-    // No data bubble
-    const msg = el(
-      "div",
-      {
-        class: "no-data",
-        style: {
-          position: "absolute",
-          top: "12px",
-          left: "50%",
-          transform: "translateX(-50%)",
-          background: "white",
-          padding: "10px 14px",
-          borderRadius: "12px",
-          boxShadow: "0 6px 18px rgba(0,0,0,0.15)",
-          zIndex: 500,
-          fontSize: "14px",
-        },
-      },
-      "Nincs adat / nincs riportált TOP10 tétel."
-    );
-    mapDiv.style.position = "relative";
-    mapDiv.appendChild(msg);
+  for (const it of items) {
+    const li = document.createElement("li");
+    li.style.margin = "6px 0";
+    li.innerHTML =
+      `<strong>${escapeHtml(it.recipient)}</strong><br>` +
+      `<span style="opacity:.85">Commitments:</span> ${fmtUSD(it.commitments)} &nbsp; | &nbsp; ` +
+      `<span style="opacity:.85">Disbursements:</span> ${fmtUSD(it.disbursements)}`;
+    ul.appendChild(li);
   }
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;"
+  }[c]));
 }
 
 async function main() {
-  const root = document.getElementById("app");
-  if (!root) throw new Error('Missing root element: <div id="app"></div>');
+  const root = ensureBaseLayout();
 
-  const data = await loadData();
+  // Fejléc / cím
+  const title = document.createElement("div");
+  title.style.margin = "10px 0 18px 0";
+  title.style.fontSize = "16px";
+  title.textContent = "Adat: OCHA Financial Tracking Service (FTS) – humanitárius finanszírozás (reported)";
+  root.prepend(title);
 
-  // Header line
-  const header = document.getElementById("meta");
-  if (header) {
-    header.textContent = `Adat: OCHA Financial Tracking Service (FTS) – humanitárius finanszírozás (reported) | Year: ${data.year} | Updated: ${data.updated}`;
-  }
+  const url = DATA_URL + "?cb=" + Date.now(); // cache bust
+  const res = await fetch(url, { cache: "no-store" });
+  if (!res.ok) throw new Error("Nem sikerült betölteni: " + DATA_URL);
 
-  const donors = (data && data.donors) || {};
+  const data = await res.json();
+  const donors = (data && data.donors) ? data.donors : {};
 
-  // Render in a 2-column grid if you already have CSS; otherwise it will stack.
-  for (const key of DONOR_ORDER) {
-    if (donors[key]) buildDonorSection(root, key, donors[key]);
-  }
+  // Ha a JSON-ban más donorok vannak, ezt is vegyük fel
+  const donorNames = Array.from(new Set([
+    ...DONOR_ORDER.filter(d => donors[d] !== undefined),
+    ...Object.keys(donors)
+  ]));
 
-  // Render any extra donors not in the list (just in case)
-  for (const [key, obj] of Object.entries(donors)) {
-    if (!DONOR_ORDER.includes(key)) buildDonorSection(root, key, obj);
+  for (const donor of donorNames) {
+    const { ul } = createDonorSection(root, donor);
+    const items = normalizeDonorData(donors[donor]);
+    fillList(ul, items);
   }
 }
 
-main().catch((err) => {
-  console.error(err);
-  const root = document.getElementById("app");
-  if (root) {
-    root.innerHTML = `<pre style="color:#b00020;white-space:pre-wrap">APP ERROR:\n${String(
-      err && err.stack ? err.stack : err
-    )}</pre>`;
-  }
+document.addEventListener("DOMContentLoaded", () => {
+  main().catch(err => {
+    console.error(err);
+    const root = ensureBaseLayout();
+    const box = document.createElement("pre");
+    box.style.whiteSpace = "pre-wrap";
+    box.style.padding = "12px";
+    box.style.border = "1px solid rgba(0,0,0,0.2)";
+    box.style.borderRadius = "12px";
+    box.textContent = "Hiba: " + (err && err.message ? err.message : String(err));
+    root.appendChild(box);
+  });
 });
