@@ -1,15 +1,15 @@
 import json
 import time
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Any, Optional
 
 import requests
 
 YEAR = 2025
 OUT_PATH = "data/top10_2025.json"
 
-# Kulcs: ami a weben megjelenik (a te oldalon)
-# Érték: donor név, amit az FTS nagy eséllyel elfogad
+# Kulcs: ami a weben megjelenik
+# Érték: donor név (amit az FTS API tipikusan elfogad)
 DONORS: Dict[str, str] = {
     "EU": "European Union",
     "USA": "United States of America",
@@ -23,207 +23,182 @@ DONORS: Dict[str, str] = {
     "Netherlands": "Netherlands",
 }
 
-# Az előző hibád itt volt: api.humdata.org -> NEM jó.
-# Az FTS API tipikusan ezen megy:
-BASE_URLS = [
-    "https://api.hpc.tools/v1/fts/flows",
-    # tartalék (ha valamiért átirányít / változik):
-    "https://fts.unocha.org/api/v1/flows",
-]
-
-# Ha az API paraméter neve eltér, több variációt próbálunk.
-FLOWTYPE_PARAM_CANDIDATES = ["flowType", "flowtype", "type"]
-GROUPBY_PARAM_CANDIDATES = ["groupby", "groupBy"]
-
-# A két “féle támogatás”
-FLOW_TYPES = {
-    "commitments": "commitment",
-    "disbursements": "disbursement",
-}
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "top10-map/1.0"})
 
 
-def _as_float(x: Any) -> Optional[float]:
+def _get_json(url: str, params: Dict[str, Any], timeout: int = 30) -> Optional[Dict[str, Any]]:
     try:
-        if x is None:
-            return None
-        return float(x)
+        r = SESSION.get(url, params=params, timeout=timeout)
+        r.raise_for_status()
+        return r.json()
     except Exception:
         return None
 
 
-def _pick_amount(item: Dict[str, Any]) -> Optional[float]:
-    # Sokféle kulcsnév előfordulhat, ezért több mezőt is nézünk
-    for k in [
-        "amountUSD",
-        "amountUsd",
-        "amount",
-        "total",
-        "totalAmount",
-        "total_amount",
-        "value",
-        "valueUsd",
-        "originalAmount",
-    ]:
-        if k in item:
-            v = _as_float(item.get(k))
-            if v is not None:
-                return v
-    return None
+def _to_number(x: Any) -> float:
+    try:
+        if x is None:
+            return 0.0
+        if isinstance(x, (int, float)):
+            return float(x)
+        s = str(x).replace(",", "").strip()
+        return float(s) if s else 0.0
+    except Exception:
+        return 0.0
 
 
-def _pick_name_and_iso(item: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
-    # Recipient/destination mezők is sokféleképp jöhetnek
-    for name_key in ["recipient", "recipientName", "destination", "destinationName", "locationName", "countryName", "name"]:
-        if name_key in item and item.get(name_key):
-            name = str(item.get(name_key))
-            iso = None
-            for iso_key in ["iso2", "ISO2", "countryCode", "recipientIso2", "destinationIso2", "code"]:
-                if iso_key in item and item.get(iso_key):
-                    iso = str(item.get(iso_key))
-                    break
-            return name, iso
-    return None, None
+def _guess_amount(obj: Dict[str, Any], prefer: List[str]) -> float:
+    """
+    Preferencia-lista alapján keres egy USD/amount mezőt.
+    Pl. prefer=['disbursement','paid','funding'] stb.
+    """
+    # 1) preferált kulcsszavak
+    for kw in prefer:
+        for k, v in obj.items():
+            lk = str(k).lower()
+            if kw in lk and ("usd" in lk or "amount" in lk or "value" in lk):
+                val = _to_number(v)
+                if val:
+                    return val
+
+    # 2) bármilyen "usd" + amount/value
+    for k, v in obj.items():
+        lk = str(k).lower()
+        if "usd" in lk and ("amount" in lk or "value" in lk or "total" in lk):
+            val = _to_number(v)
+            if val:
+                return val
+
+    return 0.0
 
 
-def _extract_rows(payload: Any) -> List[Dict[str, Any]]:
-    # Várhatóan dict és benne "data" lista, de legyen robust
-    if isinstance(payload, dict):
-        if isinstance(payload.get("data"), list):
-            return payload["data"]
-        if isinstance(payload.get("results"), list):
-            return payload["results"]
-        # néha a top-szint maga a lista:
-    if isinstance(payload, list):
-        return payload
+def _guess_recipient(obj: Dict[str, Any]) -> str:
+    for key in ["recipient", "recipientName", "recipient_name", "destination", "destinationName", "to", "country", "name"]:
+        if key in obj and obj[key]:
+            return str(obj[key])
+    # néha nested
+    for key in ["recipient", "destination", "to"]:
+        if key in obj and isinstance(obj[key], dict):
+            for k2 in ["name", "title", "label"]:
+                if k2 in obj[key] and obj[key][k2]:
+                    return str(obj[key][k2])
+    return ""
+
+
+def _normalize_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Visszaad 10 sort: recipient + commitments_usd + disbursements_usd + total_usd.
+    """
+    agg: Dict[str, Dict[str, float]] = {}
+
+    for r in rows:
+        recipient = _guess_recipient(r).strip()
+        if not recipient:
+            continue
+
+        # commitments vs disbursements: best-effort mező-felismerés
+        committed = _guess_amount(r, prefer=["commit", "pledge"])
+        disbursed = _guess_amount(r, prefer=["disburse", "paid", "fund", "contribution"])
+
+        # ha csak egy értéket találunk, tegyük total-nak
+        total = 0.0
+        if committed or disbursed:
+            total = committed + disbursed
+        else:
+            total = _guess_amount(r, prefer=["total"])
+
+        if recipient not in agg:
+            agg[recipient] = {"commitments_usd": 0.0, "disbursements_usd": 0.0, "total_usd": 0.0}
+
+        agg[recipient]["commitments_usd"] += committed
+        agg[recipient]["disbursements_usd"] += disbursed
+        agg[recipient]["total_usd"] += (total if total else (committed + disbursed))
+
+    # rendezés total alapján
+    out = []
+    for recipient, vals in agg.items():
+        total = vals["total_usd"]
+        if total <= 0:
+            total = vals["commitments_usd"] + vals["disbursements_usd"]
+        out.append(
+            {
+                "recipient": recipient,
+                "commitments_usd": round(vals["commitments_usd"], 2),
+                "disbursements_usd": round(vals["disbursements_usd"], 2),
+                "total_usd": round(total, 2),
+            }
+        )
+
+    out.sort(key=lambda x: x.get("total_usd", 0.0), reverse=True)
+    return out[:10]
+
+
+def _extract_rows_from_response(data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Többféle API válaszformátumot próbál kezelni.
+    """
+    if not data:
+        return []
+
+    # gyakori: {"data":[...]}
+    if isinstance(data.get("data"), list):
+        return [x for x in data["data"] if isinstance(x, dict)]
+
+    # néha: {"results":[...]}
+    if isinstance(data.get("results"), list):
+        return [x for x in data["results"] if isinstance(x, dict)]
+
+    # néha: {"items":[...]}
+    if isinstance(data.get("items"), list):
+        return [x for x in data["items"] if isinstance(x, dict)]
+
+    # fallback: ha maga lista lenne (ritkább)
+    if isinstance(data, list):
+        return [x for x in data if isinstance(x, dict)]
+
     return []
 
 
-def fetch_top10_for_donor(donor_query: str, flow_type_value: str) -> List[Dict[str, Any]]:
+def fetch_top10_for_donor(donor_name: str) -> List[Dict[str, Any]]:
     """
-    Visszaad TOP10 recipient listát:
-    [
-      { "recipient": "...", "iso2": "UA", "amount_usd": 12345.67 },
-      ...
+    Több végpontot próbál (ha az egyik nem megy / üres, jön a következő).
+    A cél: 2025-ben donor -> top10 recipient, commitments & disbursements külön.
+    """
+    endpoints = [
+        # 1) HPC Tools public API (ha elérhető)
+        ("https://api.hpc.tools/v1/public/fts/flow", {"year": YEAR, "donor": donor_name, "groupby": "recipient", "limit": 200}),
+        ("https://api.hpc.tools/v1/public/fts/flows", {"year": YEAR, "donor": donor_name, "groupby": "recipient", "limit": 200}),
+        # 2) Humdata API (ha elérhető)
+        ("https://api.humdata.org/v1/fts/flows", {"year": YEAR, "donor": donor_name, "groupby": "recipient", "limit": 200}),
+        # 3) UNOCHA FTS (régebbi v2 – ha engedi)
+        ("https://fts.unocha.org/api/v2/flows", {"year": YEAR, "donor": donor_name, "groupBy": "recipient", "limit": 200}),
     ]
-    """
-    session = requests.Session()
-    session.headers.update({"User-Agent": "top10-fts-bot/1.0"})
 
-    # Próbáljuk több URL-lel és több paraméter variációval
-    last_error = None
+    for url, params in endpoints:
+        data = _get_json(url, params=params)
+        rows = _extract_rows_from_response(data) if data else []
+        norm = _normalize_rows(rows)
+        if norm:
+            return norm
 
-    for base_url in BASE_URLS:
-        for flowtype_param in FLOWTYPE_PARAM_CANDIDATES:
-            for groupby_param in GROUPBY_PARAM_CANDIDATES:
-                params = {
-                    "year": YEAR,
-                    "donor": donor_query,
-                    groupby_param: "recipient",
-                    "limit": 10,
-                    "sort": "desc",
-                    flowtype_param: flow_type_value,
-                }
+        # ha nem sikerült, várunk kicsit (rate-limit / átmeneti)
+        time.sleep(1)
 
-                try:
-                    r = session.get(base_url, params=params, timeout=30)
-                    if r.status_code >= 400:
-                        last_error = f"{base_url} -> HTTP {r.status_code}: {r.text[:200]}"
-                        continue
-
-                    payload = r.json()
-                    rows = _extract_rows(payload)
-
-                    out: List[Dict[str, Any]] = []
-                    for row in rows:
-                        if not isinstance(row, dict):
-                            continue
-
-                        name, iso2 = _pick_name_and_iso(row)
-                        amt = _pick_amount(row)
-
-                        if name and (amt is not None):
-                            out.append(
-                                {
-                                    "recipient": name,
-                                    "iso2": (iso2.upper() if isinstance(iso2, str) else None),
-                                    "amount_usd": amt,
-                                }
-                            )
-
-                    # Ha kaptunk értelmes adatot, visszaadjuk
-                    if len(out) > 0:
-                        return out
-
-                except Exception as e:
-                    last_error = f"{base_url} -> {type(e).__name__}: {e}"
-                    continue
-
-    print(f"[WARN] No data for donor='{donor_query}' flowType='{flow_type_value}'. Last error: {last_error}")
     return []
 
 
-def merge_commitments_disbursements(
-    commitments: List[Dict[str, Any]], disbursements: List[Dict[str, Any]]
-) -> List[Dict[str, Any]]:
-    """
-    Egy listába összefésüli a két típust recipient alapján,
-    hogy a térkép egyből tudjon dolgozni vele, és külön látszódjon mindkettő.
-    """
-    by_key: Dict[str, Dict[str, Any]] = {}
+def main():
+    result = {"year": YEAR, "updated": datetime.utcnow().isoformat() + "Z", "donors": {}}
 
-    def key_of(x: Dict[str, Any]) -> str:
-        # iso2 ha van, különben név
-        iso2 = (x.get("iso2") or "").strip().upper()
-        if iso2:
-            return f"ISO:{iso2}"
-        return f"NAME:{(x.get('recipient') or '').strip().lower()}"
-
-    for row in commitments:
-        k = key_of(row)
-        by_key.setdefault(k, {"recipient": row.get("recipient"), "iso2": row.get("iso2"), "commitment_usd": 0.0, "disbursement_usd": 0.0})
-        by_key[k]["commitment_usd"] = float(row.get("amount_usd") or 0.0)
-
-    for row in disbursements:
-        k = key_of(row)
-        by_key.setdefault(k, {"recipient": row.get("recipient"), "iso2": row.get("iso2"), "commitment_usd": 0.0, "disbursement_usd": 0.0})
-        by_key[k]["disbursement_usd"] = float(row.get("amount_usd") or 0.0)
-
-    # A térképhez “alap” amount mezőnek tegyük a disbursement-et (legtöbbször ezt akarod látni),
-    # de a popupban majd külön kiírható mindkettő.
-    merged = list(by_key.values())
-    for x in merged:
-        x["amount_usd"] = x.get("disbursement_usd", 0.0)
-
-    # Rendezés: disbursement szerint csökkenő, és TOP10
-    merged.sort(key=lambda z: float(z.get("disbursement_usd") or 0.0), reverse=True)
-    return merged[:10]
-
-
-def main() -> None:
-    result: Dict[str, Any] = {
-        "year": YEAR,
-        "updated": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
-        "donors": {},
-    }
-
-    for donor_key, donor_query in DONORS.items():
-        print(f"Fetching donor={donor_key} ({donor_query}) year={YEAR} ...")
-
-        comm = fetch_top10_for_donor(donor_query, FLOW_TYPES["commitments"])
-        time.sleep(0.4)  # kicsi udvariasság
-
-        disb = fetch_top10_for_donor(donor_query, FLOW_TYPES["disbursements"])
-        time.sleep(0.4)
-
-        merged = merge_commitments_disbursements(comm, disb)
-        result["donors"][donor_key] = merged
-
-        print(f"  -> {len(merged)} merged recipients")
+    for label, donor_name in DONORS.items():
+        print(f"Fetching {label} ({donor_name}) ...")
+        result["donors"][label] = fetch_top10_for_donor(donor_name)
 
     with open(OUT_PATH, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2, ensure_ascii=False)
 
-    print(f"OK: wrote {OUT_PATH}")
+    print(f"Saved: {OUT_PATH}")
 
 
 if __name__ == "__main__":
