@@ -1,46 +1,16 @@
 {
   "year": 2025,
-  "updated": "2026-02-04T08:37:23Z",
+  "updated": "2026-02-04T08:50:29Z",
   "donors": {
-    "EU": {
-      "commitments": [],
-      "disbursements": []
-    },
-    "USA": {
-      "commitments": [],
-      "disbursements": []
-    },
-    "Germany": {
-      "commitments": [],
-      "disbursements": []
-    },
-    "UK": {
-      "commitments": [],
-      "disbursements": []
-    },
-    "Japan": {
-      "commitments": [],
-      "disbursements": []
-    },
-    "France": {
-      "commitments": [],
-      "disbursements": []
-    },
-    "Canada": {
-      "commitments": [],
-      "disbursements": []
-    },
-    "Sweden": {
-      "commitments": [],
-      "disbursements": []
-    },
-    "Norway": {
-      "commitments": [],
-      "disbursements": []
-    },
-    "Netherlands": {
-      "commitments": [],
-      "disbursements": []
-    }
+    "EU": [],
+    "USA": [],
+    "Germany": [],
+    "UK": [],
+    "Japan": [],
+    "France": [],
+    "Canada": [],
+    "Sweden": [],
+    "Norway": [],
+    "Netherlands": []
   }
 }
