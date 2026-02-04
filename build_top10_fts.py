@@ -1,18 +1,14 @@
 import json
-import time
 from datetime import datetime
-from collections import defaultdict
-
-import requests
+from pathlib import Path
 
 YEAR = 2025
-OUT_PATH = "data/top10_2025.json"
+OUT_PATH = Path("data/top10_2025.json")
 
-# Itt a kulcs a te "donor neve" (ami a weben megjelenik),
-# az érték pedig az a donor string, amit a Humdata FTS API nagy eséllyel ért.
+# Donor kulcs = ami a weben megjelenik
 DONORS = {
     "EU": "European Union",
-    "USA": "United States of America",
+    "USA": "United States",
     "Germany": "Germany",
     "UK": "United Kingdom",
     "Japan": "Japan",
@@ -23,140 +19,162 @@ DONORS = {
     "Netherlands": "Netherlands",
 }
 
-BASE_URL = "https://api.humdata.org/v1/fts/flows"
-
-# több donor-név variációt próbálunk, ha a fő nem ad vissza adatot
-DONOR_ALIASES = {
-    "EU": ["European Union", "European Union Institutions", "EU"],
-    "USA": ["United States of America", "United States", "USA", "US"],
-    "UK": ["United Kingdom", "UK"],
+# 2 féle támogatás (külön értékekkel)
+TYPES = {
+    "commitments": "commit",      # jelölő a későbbi szűréshez
+    "disbursements": "disburse",  # jelölő a későbbi szűréshez
 }
 
-def safe_get(d: dict, *keys, default=None):
-    cur = d
-    for k in keys:
-        if not isinstance(cur, dict) or k not in cur:
-            return default
-        cur = cur[k]
-    return cur
+def _safe_float(x):
+    try:
+        return float(x)
+    except Exception:
+        return None
 
-def fetch_flows(donor_query: str, year: int):
-    # nagyon védett, többféle válaszformát kezel
-    params = {
-        "year": year,
-        "donor": donor_query,
-        # nagyobb limit, hogy legyen miből top10-et számolni
-        "limit": 1000,
-    }
-    r = requests.get(BASE_URL, params=params, timeout=30)
-    r.raise_for_status()
-    return r.json()
+def _pick_value_col(df):
+    """Megpróbálja kitalálni az érték oszlopot (oda_data különböző verzióknál eltérhet)."""
+    for c in ["value", "Value", "OBS_VALUE", "obs_value", "amount", "Amount"]:
+        if c in df.columns:
+            return c
+    return None
 
-def parse_and_aggregate(flow_json: dict):
+def _find_col(df, candidates):
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+def _normalize_text(x):
+    return (str(x) if x is not None else "").strip().lower()
+
+def _is_commitment(row, measure_col):
+    m = _normalize_text(row.get(measure_col))
+    # tipikus megnevezések: "Commitments", "Total commitments", stb.
+    return "commit" in m
+
+def _is_disbursement(row, measure_col):
+    m = _normalize_text(row.get(measure_col))
+    # tipikus megnevezések: "Disbursements", "Gross disbursements", stb.
+    return "disburs" in m
+
+def fetch_top10_for_donor(donor_name: str):
     """
-    Kinyeri a recipient/célország neveket és az összegeket (USD),
-    majd országonként összeadja.
+    OECD ODA adatok lekérése oda_data csomagon keresztül.
+    Cél: donor -> TOP10 recipiens lista (commitments és disbursements külön).
     """
-    totals = defaultdict(float)
+    try:
+        # oda_data telepítve lesz a workflowban
+        from oda_data import oda_reader
+    except Exception as e:
+        print("ERROR: oda_data nincs telepítve:", e)
+        return {k: [] for k in TYPES.keys()}
 
-    # A Humdata API többféle struktúrát adhat, ezért több helyet is nézünk:
-    data = flow_json.get("data")
-    if data is None:
-        data = flow_json.get("results")
-    if data is None:
-        data = flow_json.get("items")
-    if not isinstance(data, list):
-        return totals
+    # Megpróbáljuk a DAC1 táblát letölteni donor+év szűréssel.
+    # A paraméterek az oda_data verziótól függhetnek, ezért több fallback-et is adunk.
+    df = None
+    errors = []
 
-    for item in data:
-        if not isinstance(item, dict):
-            continue
+    # 1) Legszűkebb próbálkozás
+    try:
+        df = oda_reader.download_dac1(donor=donor_name, year=YEAR, dotstat_codes=False)
+    except Exception as e:
+        errors.append(f"download_dac1(donor, year) failed: {e}")
 
-        # ország / destination név - több lehetséges kulcs
-        country = (
-            safe_get(item, "destination", "name")
-            or safe_get(item, "recipient", "name")
-            or safe_get(item, "location", "name")
-            or item.get("destination")
-            or item.get("recipient")
-            or item.get("country")
-        )
-
-        if isinstance(country, dict):
-            country = country.get("name")
-
-        if not isinstance(country, str) or not country.strip():
-            continue
-
-        # összeg - több lehetséges kulcs
-        amount = (
-            item.get("amountUSD")
-            or item.get("amount_usd")
-            or item.get("amount")
-            or safe_get(item, "value", "amountUSD")
-            or safe_get(item, "value", "amount")
-        )
-
+    # 2) Fallback: csak donor, majd szűrünk
+    if df is None:
         try:
-            amount = float(amount)
-        except Exception:
-            continue
+            df = oda_reader.download_dac1(donor=donor_name, dotstat_codes=False)
+            # year szűrés később
+        except Exception as e:
+            errors.append(f"download_dac1(donor) failed: {e}")
 
-        if amount <= 0:
-            continue
+    if df is None:
+        print("ERROR: Nem sikerült adatot letölteni a donorhoz:", donor_name)
+        for msg in errors:
+            print("  -", msg)
+        return {k: [] for k in TYPES.keys()}
 
-        totals[country.strip()] += amount
+    # Oszlopok kitalálása
+    value_col = _pick_value_col(df)
+    year_col = _find_col(df, ["year", "Year", "TIME_PERIOD", "time_period"])
+    recip_col = _find_col(df, ["recipient", "Recipient", "RECIPIENT", "recipient_name"])
+    measure_col = _find_col(df, ["measure", "Measure", "MEASURE", "measure_name"])
+    flow_col = _find_col(df, ["flow_type", "Flow type", "FLOW_TYPE", "flow"])
 
-    return totals
+    if value_col is None or year_col is None or recip_col is None:
+        print("ERROR: Hiányzó szükséges oszlop(ok). Oszlopok:", list(df.columns))
+        return {k: [] for k in TYPES.keys()}
 
-def get_top10_for_donor(donor_label: str, year: int):
-    candidates = DONOR_ALIASES.get(donor_label, [DONORS[donor_label]])
+    # Év szűrés
+    try:
+        df = df[df[year_col].astype(str) == str(YEAR)]
+    except Exception:
+        # ha valamiért nem sztringesíthető
+        df = df[df[year_col] == YEAR]
 
-    best = []
-    best_count = 0
+    # ODA szűrés (ha van flow oszlop)
+    # Nem erőltetjük túl: ha felismerhető "oda", akkor szűrjük.
+    if flow_col is not None:
+        flow_txt = df[flow_col].astype(str).str.lower()
+        # tipikus: "ODA", "Total ODA", stb.
+        df = df[flow_txt.str.contains("oda", na=False)]
 
-    for dq in candidates:
-        try:
-            raw = fetch_flows(dq, year)
-            totals = parse_and_aggregate(raw)
+    # Érték oszlop float
+    df = df.copy()
+    df[value_col] = df[value_col].apply(_safe_float)
 
-            # top10 (USD -> millió USD)
-            top = sorted(totals.items(), key=lambda x: x[1], reverse=True)[:10]
-            if len(top) > best_count:
-                best_count = len(top)
-                best = top
+    # kiszórjuk a hiányzókat
+    df = df[df[value_col].notna()]
 
-            # ha már van normális mennyiségű adat, nem próbálkozunk tovább
-            if best_count >= 8:
-                break
+    # commitments / disbursements top10 számítás
+    out = {k: [] for k in TYPES.keys()}
 
-            time.sleep(0.2)
-        except Exception:
-            continue
+    if measure_col is None:
+        # ha nincs measure, akkor legalább egy listát adunk vissza "disbursements" néven
+        grp = df.groupby(recip_col, as_index=False)[value_col].sum()
+        grp = grp.sort_values(value_col, ascending=False).head(10)
+        out["disbursements"] = [
+            {"country": str(r[recip_col]), "amount": float(r[value_col])}
+            for _, r in grp.iterrows()
+        ]
+        out["commitments"] = []
+        return out
 
-    # átalakítás a frontended formájára
-    out = []
-    for country, usd in best:
-        out.append({
-            "country": country,
-            "value": round(usd / 1_000_000, 2)  # millió USD
-        })
+    # commitments
+    df_commit = df[df.apply(lambda r: _is_commitment(r, measure_col), axis=1)]
+    grp_c = df_commit.groupby(recip_col, as_index=False)[value_col].sum()
+    grp_c = grp_c.sort_values(value_col, ascending=False).head(10)
+    out["commitments"] = [
+        {"country": str(r[recip_col]), "amount": float(r[value_col])}
+        for _, r in grp_c.iterrows()
+    ]
+
+    # disbursements
+    df_disb = df[df.apply(lambda r: _is_disbursement(r, measure_col), axis=1)]
+    grp_d = df_disb.groupby(recip_col, as_index=False)[value_col].sum()
+    grp_d = grp_d.sort_values(value_col, ascending=False).head(10)
+    out["disbursements"] = [
+        {"country": str(r[recip_col]), "amount": float(r[value_col])}
+        for _, r in grp_d.iterrows()
+    ]
+
     return out
+
 
 def main():
     result = {
         "year": YEAR,
-        "updated": datetime.utcnow().isoformat(timespec="microseconds") + "Z",
-        "donors": {}
+        "updated": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "donors": {},
     }
 
-    for donor_label in DONORS.keys():
-        result["donors"][donor_label] = get_top10_for_donor(donor_label, YEAR)
+    for key, donor_name in DONORS.items():
+        print(f"Fetching OECD DAC1 for donor: {key} ({donor_name}) year={YEAR} ...")
+        result["donors"][key] = fetch_top10_for_donor(donor_name)
 
-    with open(OUT_PATH, "w", encoding="utf-8") as f:
-        json.dump(result, f, ensure_ascii=False, indent=2)
-
-    print(f"Data updated: {OUT_PATH}")
+    OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    OUT_PATH.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"Data updated: {OUT_PATH.as_posix()}")
 
 if __name__ == "__main__":
     main()
